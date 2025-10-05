@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16   # PostgreSQL 16 with pgvector preinstalled
+    container_name: rag_pgvector_db
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      TZ: Asia/Jerusalem
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persistent PGDATA volume (keeps DB between restarts)
+      - pgdata:/var/lib/postgresql/data
+      # Auto-init SQL scripts (run ONLY on first init of PGDATA)
+      - ./backend/app/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
