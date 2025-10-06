@@ -1,12 +1,16 @@
+# backend/app/db/deps.py
 from __future__ import annotations
-import psycopg
-from fastapi import HTTPException, status
-from app.db.session import pool
+from app.db.session import DatabasePool
+import logging
 
-def get_db() -> psycopg.Connection:
-    if pool is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="DB pool not initialized."
-        )
-    return pool.connection()
+logger = logging.getLogger("rag.db")
+
+def get_db():
+    """FastAPI dependency that yields a psycopg connection from the pool."""
+    if not DatabasePool.pool:
+        logger.warning("DatabasePool not initialized; initializing automatically.")
+        DatabasePool.init()
+
+    # psycopg_pool gives a real psycopg.Connection via context manager
+    with DatabasePool.pool.connection() as conn:
+        yield conn

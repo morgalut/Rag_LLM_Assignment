@@ -1,61 +1,48 @@
+# backend/app/db/session.py
 from __future__ import annotations
-import logging
+import psycopg
 from psycopg_pool import ConnectionPool
 from app.db.config import settings
+import logging
 
 logger = logging.getLogger("rag.db")
 
-pool: ConnectionPool | None = None
+class DatabasePool:
+    """Global psycopg3 connection pool."""
+    pool: ConnectionPool | None = None
 
-def init_pool() -> ConnectionPool:
-    global pool
-    if pool is None:
-        logger.info("Creating psycopg3 pool to %s:%s/%s",
-                    settings.db_host, settings.db_port, settings.db_name)
-        pool = ConnectionPool(
-            conninfo=settings.dsn,
+    @classmethod
+    def init(cls):
+        if cls.pool:
+            logger.info("Database pool already initialized.")
+            return
+
+        dsn = settings.database_url
+        cls.pool = ConnectionPool(
+            conninfo=dsn,
             min_size=1,
             max_size=10,
-            kwargs={"autocommit": True},
+            num_workers=2,
+            timeout=30,
         )
-        # Smoke test
-        with pool.connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            cur.fetchone()
-        logger.info("DB pool ready.")
-    return pool
+        logger.info("✅ Database connection pool initialized.")
 
-def close_pool() -> None:
-    global pool
-    if pool is not None:
-        pool.close()
-        pool = None
-        logger.info("DB pool closed.")
+    @classmethod
+    def close(cls):
+        if cls.pool:
+            cls.pool.close()
+            cls.pool = None
+            logger.info("🧹 Database pool closed.")
 
 def ping_db() -> tuple[bool, str]:
-    """
-    Try a simple SELECT 1; using the pool if available (preferred),
-    or a one-off connection if the pool isn't ready yet.
-    Returns (ok, message).
-    """
-    import psycopg
-
+    """Check DB connectivity."""
     try:
-        if pool is not None:
-            with pool.connection() as conn, conn.cursor() as cur:
+        if not DatabasePool.pool:
+            return False, "Pool not initialized"
+        with DatabasePool.pool.connection() as conn:
+            with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
-                cur.fetchone()
-        else:
-            with psycopg.connect(settings.dsn) as conn, conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                cur.fetchone()
-
-        msg = f"Database connection successful: {settings.db_host}:{settings.db_port}/{settings.db_name}"
-        logger.info(msg)
-        print(msg)  # explicit print as requested
-        return True, msg
+                res = cur.fetchone()
+                return True, f"Database connection successful: {settings.db_host}:{settings.db_port}/{settings.db_name}"
     except Exception as e:
-        msg = f"Database connection failed: {e}"
-        logger.error(msg)
-        print(msg)
-        return False, msg
+        return False, str(e)

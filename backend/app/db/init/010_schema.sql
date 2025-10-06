@@ -1,9 +1,10 @@
+-- backend/app/db/init/010_schema.sql
 -- One row per paper
 CREATE TABLE IF NOT EXISTS papers (
   doc_id      TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
   abstract    TEXT NOT NULL,
-  embedding   vector(384) NOT NULL,
+  embedding   vector(768) NOT NULL,
   created_at  TIMESTAMPTZ DEFAULT now()
 );
 
