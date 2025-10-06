@@ -1,6 +1,8 @@
+name: onprem-rag-stack
+
 services:
   db:
-    image: pgvector/pgvector:pg16              # PostgreSQL 16 with pgvector
+    image: pgvector/pgvector:pg16
     container_name: rag_pgvector_db
     restart: unless-stopped
     environment:
@@ -11,36 +13,43 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Persistent database storage (keeps data between restarts)
       - pgdata:/var/lib/postgresql/data
-      # Auto-init SQL scripts (run only on first init of pgdata)
       - ./backend/app/db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ragnet
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
 
-  # -----------------------------------------------------------
-  # 🧭 PostgreSQL GUI (pgAdmin 4)
-  # -----------------------------------------------------------
-  pgadmin:
-    image: dpage/pgadmin4:8
-    container_name: rag_pgadmin
+  ollama:
+    build:
+      context: ./infra/ollama
+      dockerfile: Dockerfile
+      args:
+        USE_OFFLINE_MODELS: "${USE_OFFLINE_MODELS:-0}"
+    container_name: rag_ollama
     restart: unless-stopped
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@local.com     # login email
-      PGADMIN_DEFAULT_PASSWORD: admin            # login password
-      PGADMIN_CONFIG_SERVER_MODE: "False"        # single-user mode
+      OLLAMA_KEEP_ALIVE: 24h
       TZ: Asia/Jerusalem
     ports:
-      - "5050:80"                                # open http://localhost:5050
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
+      - "11434:11434"
+    # REMOVE the volumes section to use built-in models
+    networks:
+      - ragnet
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:11434/api/tags | grep -q 'models' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+networks:
+  ragnet:
+    driver: bridge
 
 volumes:
   pgdata:
-  pgadmin_data:
+  ollama_models:

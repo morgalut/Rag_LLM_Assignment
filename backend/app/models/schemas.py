@@ -11,10 +11,15 @@ class Citation(BaseModel):
     doc_id: str
     title: str
 
+class AnswerRequest(BaseModel):
+    query: str
+    k: int = 5
+    
 class AnswerResponse(BaseModel):
     answer: str
     citations: List[Citation]
     retrieved_context: List[str]
+    
 
 class HealthResponse(BaseModel):
     status: str

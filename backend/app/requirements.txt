@@ -6,3 +6,4 @@ SQLAlchemy                 # optional ORM
 python-dotenv
 numpy
 pydantic-settings
+requests
