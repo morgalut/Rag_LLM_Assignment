@@ -21,11 +21,14 @@ class AppContainer:
 def build_container(settings) -> AppContainer:
     # Embedding backend (used both for local index & pgvector queries)
     embed_mode = os.getenv("EMBEDDING_BACKEND", "ollama")  # "ollama" | "hash"
-    embedder = (OllamaEmbedding(model=os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
-                if embed_mode == "ollama"
-                else HashEmbedding(dim=int(os.getenv("EMBEDDING_DIM", "768"))))
+    embedder = (
+        OllamaEmbedding(model=os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
+        if embed_mode == "ollama"
+        else HashEmbedding(dim=int(os.getenv("EMBEDDING_DIM", "768")))
+    )
 
-    generator = OllamaAnswerGenerator(model=os.getenv("GENERATION_MODEL", "llama3.1"))
+    # ⚠️ Do NOT pass 'model=' here; OllamaAnswerGenerator reads from env
+    generator = OllamaAnswerGenerator()
 
     retriever_backend = os.getenv("RETRIEVER_BACKEND", "pgvector")  # "pgvector" | "local"
 
@@ -35,9 +38,9 @@ def build_container(settings) -> AppContainer:
         qa_service = QAService(retriever=retriever, generator=generator, cite_top_k=5)
         return AppContainer(indexing_service=None, qa_service=qa_service)
 
-    # ---- Local file index mode (previous behavior) ----
+    # ---- Local file index mode ----
     data_path = os.getenv("DATA_PATH", settings.data_path or "./data/dataset.jsonl")
-    index_dir = os.getenv("INDEX_DIR", "./.cache/index")  # <- make it writable by default
+    index_dir = os.getenv("INDEX_DIR", "./.cache/index")
     index_path = os.path.join(index_dir, "index.npy")
 
     store = InMemoryStore()
@@ -55,7 +58,6 @@ def build_container(settings) -> AppContainer:
     retriever = QARetriever(store=store, embedder=embedder, index=index)
     qa_service = QAService(retriever=retriever, generator=generator, cite_top_k=5)
     return AppContainer(indexing_service=indexing_service, qa_service=qa_service)
-
 
 
 def get_embedder():

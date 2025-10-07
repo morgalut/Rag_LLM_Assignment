@@ -27,3 +27,44 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/health/db-ping
 curl http://127.0.0.1:8080/health/debug/pool-status
 ```
+
+
+# Answer of Rag
+```sh
+# 🧠 1. Transformer architecture overview
+curl -s -X POST http://127.0.0.1:8080/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Explain how transformer architectures use self-attention."}' | jq .
+
+# ⚛️ 2. Quantum machine learning exploration
+curl -s -X POST http://127.0.0.1:8080/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"How does quantum computing improve machine learning models?"}' | jq .
+
+# 👁️ 3. Vision transformers and contrastive learning
+curl -s -X POST http://127.0.0.1:8080/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Describe how Vision Transformers can be trained using contrastive learning."}' | jq .
+
+# 🧬 4. Attention mechanism fundamentals
+curl -s -X POST http://127.0.0.1:8080/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What are the main components of the attention mechanism in transformers?"}' | jq .
+
+# 📊 5. Applications of Transformers beyond NLP
+curl -s -X POST http://127.0.0.1:8080/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"In which domains outside NLP are transformers effectively applied?"}' | jq .
+
+
+```
+
+---
+# Stream
+```sh
+curl -N -X POST "http://127.0.0.1:8080/answer/stream" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "query": "Summarize the idea behind the Transformer model in deep learning."
+         }'
+```
