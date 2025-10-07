@@ -15,7 +15,6 @@ class IngestResult(BaseModel):
     corpus_name: str
     fingerprint: Optional[str] = None
 
-    # ✅ Add these to match ingest_json_service return
     rows_processed: int
     rows_inserted: int
     rows_updated: int

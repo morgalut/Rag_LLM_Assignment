@@ -2,14 +2,12 @@
 set -e
 
 # ============================================================
-# 🧠 Unified On-Prem RAG Stack Launcher (Final Version)
+# 🧠 On-Prem RAG Stack Launcher (Local FastAPI Mode)
 # ------------------------------------------------------------
-# • Detects offline/online mode
-# • Pulls Ollama models automatically (first run)
-# • Caches models for future offline builds
-# • Builds final offline image
-# • Starts full Docker Compose stack
-# • Auto-registers missing models dynamically
+# • Runs only DB + Ollama in Docker
+# • FastAPI runs locally (e.g., uvicorn backend.app.main:app --port 8080)
+# • Waits for API readiness
+# • ✅ Automatically ingests dataset into Postgres
 # ============================================================
 
 PROJECT_NAME="onprem-rag-stack"
@@ -17,6 +15,10 @@ OLLAMA_IMAGE="local/ollama-with-models"
 MODELS_DIR="infra/ollama/offline_models"
 MODELS_BLOBS="${MODELS_DIR}/blobs"
 MODELS_MODELS="${MODELS_DIR}/models"
+API_PORT=8080
+DATA_FILE_REL="backend/app/data/arxiv_2.9k.jsonl"
+DATA_FILE_ABS="$(cd "$(dirname "$DATA_FILE_REL")" && pwd)/$(basename "$DATA_FILE_REL")"
+
 
 cd "$(dirname "$0")"
 
@@ -27,21 +29,30 @@ if ! command -v docker &>/dev/null; then
   echo "❌ Docker not found. Please install Docker first."
   exit 1
 fi
-
 if ! docker compose version &>/dev/null; then
   echo "❌ Docker Compose v2 not found. Please update Docker."
   exit 1
 fi
 
-mkdir -p "${MODELS_BLOBS}" "${MODELS_MODELS}"
 
 # ------------------------------------------------------------
-# Step 2. Pull models online (if missing)
+# Step 2. Check dataset availability
 # ------------------------------------------------------------
+if [ ! -f "$DATA_FILE_ABS" ]; then
+  echo "❌ Dataset not found at: $DATA_FILE_ABS"
+  echo "💡 Please ensure it exists before running."
+  exit 1
+fi
+echo "📄 Using dataset: $DATA_FILE_ABS"
+
+
+
+# ------------------------------------------------------------
+# Step 3. Prepare Ollama models
+# ------------------------------------------------------------
+mkdir -p "${MODELS_BLOBS}" "${MODELS_MODELS}"
 if [ ! "$(ls -A ${MODELS_BLOBS} 2>/dev/null)" ]; then
   echo "🌐 No local models detected — pulling them from Ollama registry..."
-  echo "   (this happens once; after this everything runs fully offline)"
-
   docker run --rm \
     -v "$(pwd)/${MODELS_MODELS}:/root/.ollama/models" \
     -v "$(pwd)/${MODELS_BLOBS}:/root/.ollama/blobs" \
@@ -50,34 +61,32 @@ if [ ! "$(ls -A ${MODELS_BLOBS} 2>/dev/null)" ]; then
     -c "(ollama serve > /tmp/ollama.log 2>&1 &) && sleep 10 && \
         echo '👉 Pulling nomic-embed-text...' && ollama pull nomic-embed-text && \
         echo '👉 Pulling llama3.2:3b...' && ollama pull llama3.2:3b && \
-        echo '✅ All models pulled successfully.' && \
+        echo '✅ Models pulled successfully.' && \
         pkill -f 'ollama serve' || true"
-
-  echo "✅ Models downloaded and cached locally under ${MODELS_DIR}/"
 else
-  echo "📦 Found existing local models → using OFFLINE mode"
+  echo "📦 Using cached Ollama models (offline mode)"
 fi
 
 # ------------------------------------------------------------
-# Step 3. Build final image (offline-friendly)
+# Step 4. Build Ollama image (offline-friendly)
 # ------------------------------------------------------------
 echo ""
-echo "🔧 Building Ollama image (with offline models)..."
+echo "🔧 Building Ollama image with offline models..."
 docker build \
   --build-arg USE_OFFLINE_MODELS=1 \
   -t $OLLAMA_IMAGE \
   ./infra/ollama
 
 # ------------------------------------------------------------
-# Step 4. Launch the stack
+# Step 5. Launch only DB + Ollama (no FastAPI)
 # ------------------------------------------------------------
 echo ""
-echo "🚀 Starting Docker Compose stack..."
+echo "🚀 Starting Docker Compose stack (DB + Ollama only)..."
 docker compose down -v --remove-orphans
-docker compose up -d --build
+docker compose up -d db ollama
 
 # ------------------------------------------------------------
-# Step 5. Wait for health checks
+# Step 6. Wait for DB and Ollama health checks
 # ------------------------------------------------------------
 echo ""
 echo "⏳ Waiting for containers to become healthy..."
@@ -101,67 +110,60 @@ wait_for_health "rag_pgvector_db" "Postgres"
 wait_for_health "rag_ollama" "Ollama"
 
 # ------------------------------------------------------------
-# Step 6. Robust model verification and registration
+# Step 7. Wait for local FastAPI
 # ------------------------------------------------------------
 echo ""
-echo "🔍 Verifying registered models inside Ollama..."
+echo "⏳ Waiting for local FastAPI server on port ${API_PORT}..."
 
-# Wait a bit for Ollama to fully start
-sleep 10
-
-MAX_RETRIES=5
-retry_count=0
-REGISTERED=""
-
-while [ $retry_count -lt $MAX_RETRIES ]; do
-  REGISTERED=$(curl -s http://localhost:11434/api/tags 2>/dev/null | jq -r '.models[].name' 2>/dev/null || true)
-  if [ -n "$REGISTERED" ]; then
+for i in {1..40}; do
+  if curl -s "http://127.0.0.1:${API_PORT}/health" | grep -q "ok"; then
+    echo "✅ Local FastAPI is ready!"
     break
   fi
-  retry_count=$((retry_count + 1))
-  echo "⏳ Waiting for Ollama API... ($retry_count/$MAX_RETRIES)"
-  sleep 5
+  echo "⏳ Waiting... ($i/40)"
+  sleep 3
 done
 
-if [ -z "$REGISTERED" ]; then
-  echo "⚠️  Could not connect to Ollama API"
+# Step 8. Run ingestion from host
+echo "⏳ Waiting for Postgres to be ready before ingestion..."
+
+for i in {1..20}; do
+  if docker exec rag_pgvector_db pg_isready -U raguser -d ragdb >/dev/null 2>&1; then
+    echo "✅ Postgres is ready (attempt $i)"
+    break
+  fi
+  echo "⏳ Postgres not ready yet... ($i/20)"
+  sleep 3
+done
+
+echo "📥 Starting ingestion via local FastAPI..."
+curl -s -X POST "http://127.0.0.1:${API_PORT}/db/ingest-json" \
+  -H "Content-Type: application/json" \
+  -d "{\"path\":\"${DATA_FILE_ABS}\",\"batch_size\":64,\"embedding_mode\":\"hash\"}" \
+  | tee /tmp/ingest_result.json
+
+
+COUNT=$(docker exec -i rag_pgvector_db psql -U raguser -d ragdb -t -c "SELECT COUNT(*) FROM papers;" | tr -d '[:space:]')
+echo ""
+if [ "$COUNT" -gt 0 ]; then
+  echo "✅ Verified: $COUNT papers ingested successfully."
 else
-  echo "📋 Registered models:"
-  echo "$REGISTERED" | while read model; do
-    echo "   - $model"
-  done
+  echo "❌ Ingestion completed but DB appears empty. Check logs."
+  exit 1
 fi
 
-# Check for missing llama3.2:3b model
-if [ -n "$REGISTERED" ] && ! echo "$REGISTERED" | grep -q "llama3\.2:3b"; then
-  echo "⚙️  Attempting to register llama3.2:3b model..."
-  
-  # Simple approach: use ollama pull (will use local blobs if available)
-  if docker exec rag_ollama sh -c "ollama pull llama3.2:3b" 2>/dev/null; then
-    echo "✅ llama3.2:3b model registered successfully"
-  else
-    echo "❌ Failed to register llama3.2:3b model"
-    echo "💡 Manual fix: docker exec -it rag_ollama ollama pull llama3.2:3b"
-  fi
-elif [ -n "$REGISTERED" ]; then
-  echo "✅ All expected models are registered."
-fi
 
 # ------------------------------------------------------------
-# Step 7. Summary
+# Step 9. Summary
 # ------------------------------------------------------------
 echo ""
 echo "🎉 All systems ready!"
+echo "🧮 Database:  postgres://raguser:ragpass@localhost:5432/ragdb"
+echo "🤖 Ollama:    http://localhost:11434"
+echo "💬 FastAPI:   http://localhost:${API_PORT} (local)"
 echo ""
-echo "🧮 Database:     postgres://raguser:ragpass@localhost:5432/ragdb"
-echo "🤖 Ollama API:   http://localhost:11434"
+echo "👉 Example query:"
+echo "   curl -X POST http://127.0.0.1:${API_PORT}/answer \\"
+echo "        -H 'Content-Type: application/json' \\"
+echo "        -d '{\"query\":\"Explain Transformer architecture.\"}' | jq ."
 echo ""
-echo "👉 View containers:  docker compose ps"
-echo "👉 Check models:     curl http://localhost:11434/api/tags | jq ."
-echo "👉 Stop services:    docker compose down"
-echo ""
-
-if command -v curl &>/dev/null && command -v jq &>/dev/null; then
-  echo "🔍 Checking Ollama models..."
-  curl -s http://localhost:11434/api/tags | jq .
-fi

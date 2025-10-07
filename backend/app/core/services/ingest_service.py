@@ -10,16 +10,18 @@ from typing import List, Tuple, Iterator, Optional
 
 import psycopg
 from app.db.config import settings
+from app.db.session import DatabasePool
 from app.models.ingest_model import IngestRequest, IngestResult
 import logging
 
 log = logging.getLogger("app.ingest")
 
-# --------------------------------------------------
+# ================================================================
 # Utility functions
-# --------------------------------------------------
+# ================================================================
 def _vector_literal(vec: List[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
 
 def _hash_embedding(text: str, dim: int) -> List[float]:
     """Deterministic offline fallback embedding (not semantic)."""
@@ -42,8 +44,10 @@ def _hash_embedding(text: str, dim: int) -> List[float]:
     norm = math.sqrt(sum(v * v for v in vec)) or 1.0
     return [v / norm for v in vec]
 
+
 def _zeros_embedding(dim: int) -> List[float]:
     return [0.0] * dim
+
 
 def _fingerprint_file(path: Path, chunk_size: int = 1 << 20) -> str:
     sha = hashlib.sha256()
@@ -51,6 +55,7 @@ def _fingerprint_file(path: Path, chunk_size: int = 1 << 20) -> str:
         while chunk := f.read(chunk_size):
             sha.update(chunk)
     return sha.hexdigest()
+
 
 def _iter_json_records(path: Path) -> Iterator[dict]:
     if path.suffix.lower() == ".jsonl":
@@ -72,10 +77,12 @@ def _iter_json_records(path: Path) -> Iterator[dict]:
                     if isinstance(obj, dict):
                         yield obj
 
+
 def _embedding_for(text: str, mode: str, dim: int) -> List[float]:
     if mode == "zeros":
         return _zeros_embedding(dim)
     return _hash_embedding(text or "", dim)
+
 
 def _pick(obj: dict, keys: List[str]) -> str:
     for k in keys:
@@ -84,21 +91,17 @@ def _pick(obj: dict, keys: List[str]) -> str:
             return v.strip()
     return ""
 
+
 def _map_record(obj: dict) -> tuple[str, str, str]:
-    """
-    Map varied JSON schemas to (doc_id, title, abstract).
-    Add more aliases as needed.
-    """
+    """Map varied JSON schemas to (doc_id, title, abstract)."""
     doc_id = _pick(obj, ["id", "doc_id", "paperId", "uid", "uuid"])
     title = _pick(obj, ["title", "paper_title", "name"])
     abstract = _pick(obj, ["abstract", "summary", "abstract_text", "text", "description"])
     return doc_id, title, abstract
 
+
 def _upsert_batch(cur: psycopg.Cursor, rows: List[Tuple[str, str, str, str]]) -> Tuple[int, int]:
-    """
-    Upsert a batch of rows into the papers table.
-    Returns (inserted_count, updated_count).
-    """
+    """Upsert a batch of rows into the papers table."""
     inserted = updated = 0
     for doc_id, title, abstract, emb in rows:
         cur.execute(
@@ -119,10 +122,53 @@ def _upsert_batch(cur: psycopg.Cursor, rows: List[Tuple[str, str, str, str]]) ->
             updated += 1
     return inserted, updated
 
-# --------------------------------------------------
-# Service logic
-# --------------------------------------------------
+
+# ================================================================
+# Resilient ingestion wrapper
+# ================================================================
 def ingest_json_service(request: IngestRequest, conn: psycopg.Connection) -> IngestResult:
+    """
+    Ingest JSON/JSONL data into the `papers` table.
+    Automatically retries on transient DB restarts (AdminShutdown / closed connection).
+    """
+    for attempt in range(3):
+        try:
+            # If the connection is closed, reinitialize it
+            if conn.closed:
+                log.warning("⚠️ Connection closed — reacquiring from pool...")
+                if not DatabasePool.pool:
+                    DatabasePool.init()
+                conn = DatabasePool.pool.getconn()
+
+            return _perform_ingest(request, conn)
+
+        except psycopg.errors.AdminShutdown:
+            log.warning(f"⚠️ Database restarted (AdminShutdown). Retrying ingestion ({attempt+1}/3)...")
+            time.sleep(5)
+
+        except psycopg.OperationalError as e:
+            if "closed" in str(e).lower():
+                log.warning(f"⚠️ Connection lost, retrying ({attempt+1}/3)...")
+                time.sleep(5)
+                if not DatabasePool.pool:
+                    DatabasePool.init()
+                conn = DatabasePool.pool.getconn()
+                continue
+            else:
+                log.error(f"❌ OperationalError: {e}")
+                raise
+
+        except Exception as e:
+            log.error(f"❌ Unhandled error during ingestion attempt {attempt+1}: {e}")
+            raise
+
+    raise RuntimeError("Database kept restarting or connection failed after 3 retries. Aborting.")
+
+
+# ================================================================
+# Core ingestion logic
+# ================================================================
+def _perform_ingest(request: IngestRequest, conn: psycopg.Connection) -> IngestResult:
     start_time = time.time()
 
     data_path = Path(request.path or (settings.data_path or ""))
@@ -131,18 +177,11 @@ def ingest_json_service(request: IngestRequest, conn: psycopg.Connection) -> Ing
 
     corpus_name = request.corpus_name or data_path.name
     dim = int(settings.embedding_dim)
-
-    # ✅ Hard assert the dim matches table definition (avoid silent confusion)
-    # If your table uses vector(768), ensure settings.embedding_dim == 768
     if dim <= 0:
         raise ValueError(f"Invalid embedding_dim: {dim}")
 
     rows_processed = rows_inserted = rows_updated = rows_skipped = 0
     fp: Optional[str] = None
-
-    # Optional: ensure schema (if not public)
-    # with conn.cursor() as cur:
-    #     cur.execute("SET LOCAL search_path = public")
 
     with conn.cursor() as cur:
         batch: List[Tuple[str, str, str, str]] = []
@@ -152,7 +191,7 @@ def ingest_json_service(request: IngestRequest, conn: psycopg.Connection) -> Ing
             if not (doc_id and title and abstract):
                 rows_skipped += 1
                 if rows_skipped <= 10:
-                    log.debug("Skipping record #%d - missing fields (id/title/abstract). Keys: %s", idx, list(obj.keys()))
+                    log.debug("Skipping record #%d - missing fields. Keys: %s", idx, list(obj.keys()))
                 continue
 
             emb = _embedding_for(abstract, request.embedding_mode, dim)
@@ -165,11 +204,13 @@ def ingest_json_service(request: IngestRequest, conn: psycopg.Connection) -> Ing
                 rows_updated += upd
                 batch.clear()
 
+        # Final batch
         if batch:
             ins, upd = _upsert_batch(cur, batch)
             rows_inserted += ins
             rows_updated += upd
 
+        # Fingerprint tracking
         if request.update_fingerprint:
             fp = _fingerprint_file(data_path)
             cur.execute(
@@ -188,7 +229,7 @@ def ingest_json_service(request: IngestRequest, conn: psycopg.Connection) -> Ing
     duration = round(time.time() - start_time, 3)
     log.info(
         "📥 Ingest summary | file=%s | processed=%d | inserted=%d | updated=%d | skipped=%d | took=%.3fs",
-        str(data_path), rows_processed, rows_inserted, rows_updated, rows_skipped, duration
+        str(data_path), rows_processed, rows_inserted, rows_updated, rows_skipped, duration,
     )
 
     return IngestResult(

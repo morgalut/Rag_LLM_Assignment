@@ -7,7 +7,6 @@ from app.core.entities import Hit, RetrievalResult, Answer
 from app.core.services.grounding import enforce_citations
 
 class QARetriever:
-    """IRetriever concrete impl (kept simple to avoid over-abstracting early)."""
     def __init__(self, store: IMetadataStore, embedder: IEmbeddingModel, index: IVectorIndex):
         self.store = store
         self.embedder = embedder
@@ -36,7 +35,7 @@ class QAService:
         answer_text = self.generator.generate(
             query=query,
             contexts=[h.chunk for h in chosen],
-            citations_schema="doc_id + title"
+            citations_schema="doc_id + title",
         )
         return Answer(
             text=answer_text.strip(),
