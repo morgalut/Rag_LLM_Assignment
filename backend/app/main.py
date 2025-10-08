@@ -1,29 +1,30 @@
 from __future__ import annotations
-
 import os
 import logging
+import asyncio
+import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # ============================================================
-# 📦 Database & DI Imports
+# 🪵 Logging Setup
+# ============================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger("rag.app")
+
+# ============================================================
+# 📦 Core Imports (DB + Dependency Injection)
 # ============================================================
 from app.db.session import DatabasePool, ping_db
 from app.db.config import settings
-from app.container import build_container
-
-# ============================================================
-# 🤖 Local RAG Components (for on-prem mode)
-# ============================================================
-from app.models.store.inmemory_store import InMemoryStore
-from app.models.index.numpy_index import BasicNumpyIndex
-from app.models.fingerprint.file_fingerprint import FileFingerprint
-from app.models.embedding.hybrid_embedding import HybridEmbedding
-from app.models.llm.ollama_generator import OllamaAnswerGenerator
-from app.models.llm.extractive_generator import ExtractiveAnswerGenerator
-from app.core.services.qa_service import QARetriever, QAService
-from app.core.services.indexing_service import IndexingService
+from app.container import build_container, create_local_index_components
 
 # ============================================================
 # 🌐 Routers
@@ -32,45 +33,76 @@ from app.router.health import router as health_router
 from app.router.answer import router as answer_router
 from app.router.ingest_router import router as ingest_router
 
+# ============================================================
+# ⚙️ Global State & Application Status
+# ============================================================
+class AppState:
+    def __init__(self):
+        self.container = None
+        self.local_indexing_service = None
+        self.index_build_task = None
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag_index")
+        self.startup_time = time.time()
+        self.startup_complete = False
+        self.index_build_complete = False
+        self.index_build_progress = 0.0
+        self.index_build_status = "not_started"  # not_started, building, complete, failed
+        self.index_build_error = None
+        self.index_stats = None
+        self.lock = Lock()
+        self.mode = "unknown"
+        
+    def update_progress(self, progress: float, status: str = None):
+        with self.lock:
+            self.index_build_progress = max(0.0, min(1.0, progress))
+            if status:
+                self.index_build_status = status
+            if progress >= 1.0:
+                self.index_build_complete = True
+                self.startup_complete = True
+    
+    def set_index_stats(self, stats: dict):
+        with self.lock:
+            self.index_stats = stats
+    
+    def set_error(self, error: str):
+        with self.lock:
+            self.index_build_status = "failed"
+            self.index_build_error = error
+            self.startup_complete = True  # Still mark startup complete to avoid blocking health checks
+    
+    def set_mode(self, mode: str):
+        with self.lock:
+            self.mode = mode
+    
+    def get_status(self):
+        with self.lock:
+            return {
+                "startup_complete": self.startup_complete,
+                "index_build_complete": self.index_build_complete,
+                "index_build_status": self.index_build_status,
+                "index_build_progress": self.index_build_progress,
+                "index_build_error": self.index_build_error,
+                "index_stats": self.index_stats,
+                "mode": self.mode,
+                "uptime_seconds": time.time() - self.startup_time
+            }
+
+app_state = AppState()
 
 # ============================================================
-# 🪵 Unified Logger Setup
-# ============================================================
-logger = logging.getLogger("rag.app")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
-        "%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-
-# ============================================================
-# 🌍 Global Container / Service References
-# ============================================================
-container = None
-local_indexing_service = None
-
-
-# ============================================================
-# 🚀 Lifespan Startup / Shutdown Logic
+# 🚀 Startup / Shutdown Lifecycle
 # ============================================================
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """
-    Application startup sequence:
-    1️⃣ Initialize DB (if available)
-    2️⃣ Build DI container
-    3️⃣ Initialize RAG components (pgvector or local)
-    4️⃣ Wire QA service into router
+    Enhanced application startup lifecycle with background indexing
     """
-    global container, local_indexing_service
-    logger.info("🚀 Initializing On-Prem RAG Application...")
+    global app_state
+    
+    logger.info("🚀 Initializing Enhanced RAG Backend API...")
 
-    # --- Database initialization ---
+    # --- Database connection ---
     try:
         DatabasePool.init()
         ok, msg = ping_db()
@@ -79,85 +111,98 @@ async def lifespan(_: FastAPI):
         else:
             logger.warning(f"⚠️ DB ping failed: {msg}")
     except Exception as e:
-        logger.warning(f"⚠️ Database initialization skipped or failed: {e}")
+        logger.warning(f"⚠️ Database init skipped or failed: {e}")
 
-    # --- Dependency Injection Container ---
+    # --- Build container and determine mode ---
     try:
-        container = build_container(settings)
+        app_state.container = build_container(settings)
         from app.router import answer as answer_router_module
-        answer_router_module.qa_service = container.qa_service
 
-        # ✅ Initialize local index (if configured for file mode)
-        DATA_PATH = os.getenv("DATA_PATH")
-        if DATA_PATH and os.path.exists(DATA_PATH):
-            logger.info(f"📂 Local dataset detected → building local index for {DATA_PATH}")
-
-            INDEX_DIR = os.getenv("INDEX_DIR", "/app/index")
-            INDEX_PATH = os.path.join(INDEX_DIR, "vectors.npz")
-            FP_PATH = os.path.join(INDEX_DIR, "fp.json")
-            EMB_DIM = int(os.getenv("EMBED_DIM", "768"))
-            OLLAMA_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
-            CHUNK_LEN = int(os.getenv("CHUNK_LEN", "0"))
-
-            store = InMemoryStore()
-            embedder = HybridEmbedding(dim=EMB_DIM, ollama_model=OLLAMA_MODEL)
-            index = BasicNumpyIndex()
-            fp = FileFingerprint(FP_PATH, DATA_PATH, {"dim": EMB_DIM, "model": OLLAMA_MODEL})
-            local_indexing_service = IndexingService(store, embedder, index, fp, DATA_PATH, INDEX_PATH, chunk_len=CHUNK_LEN)
-
-            info = local_indexing_service.startup()
-            logger.info(f"📚 Local index ready | rebuilt={info['rebuilt']} | count={info['count']}")
+        # Determine operation mode
+        retriever_backend = os.getenv("RETRIEVER_BACKEND", "pgvector")
+        data_path = os.getenv("DATA_PATH")
+        use_local_index = retriever_backend == "local" and data_path and os.path.isfile(data_path)
+        
+        if use_local_index:
+            app_state.set_mode("local_index")
+            logger.info(f"📂 Local index mode detected - data: {data_path}")
             
-            # Build local QA service
-            ollama_gen = OllamaAnswerGenerator()
-            extractive_gen = ExtractiveAnswerGenerator()
+            # Start background index building
+            def build_index_with_progress():
+                try:
+                    app_state.update_progress(0.1, "building")
+                    logger.info("🔄 Starting background index building...")
+                    
+                    # Use the indexing service from container
+                    if app_state.container and app_state.container.indexing_service:
+                        info = app_state.container.indexing_service.startup()
+                        
+                        app_state.update_progress(1.0, "complete")
+                        app_state.set_index_stats(info)
+                        logger.info(f"✅ Background index building complete | rebuilt={info['rebuilt']} | count={info['count']}")
+                    else:
+                        raise RuntimeError("Indexing service not available in container")
+                        
+                except Exception as e:
+                    error_msg = f"Index building failed: {str(e)}"
+                    logger.error(f"❌ {error_msg}")
+                    app_state.set_error(error_msg)
 
-            class CompositeGen:
-                def generate(self, query, contexts, citations_schema):
-                    try:
-                        return ollama_gen.generate(query, contexts, citations_schema)
-                    except Exception as e:
-                        logger.warning(f"Ollama gen failed; fallback to extractive: {e}")
-                        return extractive_gen.generate(query, contexts, citations_schema)
-                def generate_stream(self, query, contexts, citations_schema):
-                    return ollama_gen.generate_stream(query, contexts, citations_schema)
-
-            retriever = QARetriever(store, embedder, index)
-            qa_local = QAService(retriever, CompositeGen(), cite_top_k=5)
-            answer_router_module.qa_service = qa_local
-            answer_router_module.streaming_generator = ollama_gen
+            # Submit background task
+            app_state.index_build_task = app_state.executor.submit(build_index_with_progress)
+            
+            # Set QA service for local index mode
+            answer_router_module.qa_service = app_state.container.qa_service
+            answer_router_module.streaming_generator = app_state.container.generator.ollama_gen
+            
         else:
+            app_state.set_mode("pgvector")
             logger.info("🔗 Using pgvector (Postgres) as retriever backend.")
+            answer_router_module.qa_service = app_state.container.qa_service
+        
+        # Mark startup as complete (API is usable)
+        app_state.startup_complete = True
+        logger.info("🎯 API is ready and accepting requests")
+            
     except Exception as e:
-        logger.error(f"❌ Container build or RAG init failed: {e}", exc_info=True)
+        logger.error(f"❌ Container or RAG init failed: {e}", exc_info=True)
+        app_state.set_error(f"Startup failed: {str(e)}")
+        app_state.startup_complete = True  # Still allow API to start
         raise
 
+    # --- Startup completed ---
     try:
         yield
     finally:
+        # --- Cleanup ---
         try:
+            if app_state.index_build_task and not app_state.index_build_task.done():
+                app_state.index_build_task.cancel()
+                logger.info("🛑 Cancelled background index building")
+            
+            app_state.executor.shutdown(wait=False)
             DatabasePool.close()
-            logger.info("🧹 Database pool closed.")
-        except Exception:
-            pass
-
+            logger.info("🧹 Application shutdown complete")
+        except Exception as e:
+            logger.warning(f"⚠️ Cleanup warning: {e}")
 
 # ============================================================
-# ⚙️ FastAPI App Initialization
+# 🌍 FastAPI App Definition
 # ============================================================
 app = FastAPI(
-    title="On-Prem RAG (Ollama + Postgres)",
-    version="1.1.0",
+    title="RAG Backend API",
+    description="Enhanced RAG Backend with background indexing and improved health checks",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-# CORS for UI
+# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -167,42 +212,106 @@ app.include_router(health_router)
 app.include_router(answer_router)
 app.include_router(ingest_router)
 
+# ============================================================
+# 🆕 Enhanced Status Endpoints
+# ============================================================
+@app.get("/status")
+async def get_app_status():
+    """Enhanced application status with indexing progress"""
+    status = app_state.get_status()
+    
+    # Determine overall system status
+    if status["index_build_status"] == "failed":
+        system_status = "degraded"
+    elif not status["index_build_complete"] and status["index_build_status"] == "building":
+        system_status = "initializing"
+    else:
+        system_status = "healthy"
+    
+    return {
+        "system_status": system_status,
+        "timestamp": time.time(),
+        **status
+    }
+
+@app.get("/status/index")
+async def get_index_status():
+    """Detailed index status and statistics"""
+    status = app_state.get_status()
+    
+    response = {
+        "index_status": status["index_build_status"],
+        "progress": status["index_build_progress"],
+        "error": status["index_build_error"],
+        "stats": status["index_stats"],
+        "mode": status["mode"],
+        "timestamp": time.time()
+    }
+    
+    # Add estimated time remaining if building
+    if status["index_build_status"] == "building" and status["index_build_progress"] > 0:
+        elapsed = status["uptime_seconds"]
+        estimated_total = elapsed / status["index_build_progress"]
+        remaining = max(0, estimated_total - elapsed)
+        response["estimated_seconds_remaining"] = int(remaining)
+    
+    return response
 
 # ============================================================
 # 🏠 Root Endpoint
 # ============================================================
 @app.get("/")
 def root():
-    """Root route: overview + API guide"""
-    mode = (
-        "pgvector (Postgres)"
-        if container and container.indexing_service is None
-        else "local file index"
-    )
+    """Enhanced root route with system status"""
+    status = app_state.get_status()
+    
+    system_status = "healthy"
+    if status["index_build_status"] == "failed":
+        system_status = "degraded"
+    elif status["index_build_status"] == "building":
+        system_status = "initializing"
+    
     return {
-        "app": "On-Prem RAG (Ollama + Postgres)",
-        "status": "running",
-        "docs": "/docs",
-        "health": "/health",
-        "db_ping": "/db/ping",
-        "ingest_json": {
-            "method": "POST",
-            "path": "/db/ingest-json",
-            "body_example": {
-                "path": "data/arxiv_2.9k.jsonl",
-                "batch_size": 512,
-                "embedding_mode": "hash",
-            },
-        },
-        "qa": {
-            "method": "POST",
-            "path": "/answer",
-            "body_example": {
-                "query": "How do transformers handle long context?",
-                "k": 5,
-            },
-        },
-        "retriever_backend": mode,
-        "local_index_dir": os.getenv("INDEX_DIR", "/app/index"),
+        "app": "RAG Backend API (Ollama + Postgres)",
+        "version": "2.0.0",
+        "status": system_status,
+        "mode": status["mode"],
+        "index_status": status["index_build_status"],
+        "index_progress": f"{status['index_build_progress']*100:.1f}%" if status['index_build_progress'] > 0 else "0%",
         "data_path": os.getenv("DATA_PATH"),
+        "index_dir": os.getenv("INDEX_DIR", "/app/index"),
+        "endpoints": {
+            "docs": "/docs",
+            "health": "/health",
+            "readiness": "/health/ready", 
+            "status": "/status",
+            "index_status": "/status/index"
+        },
+        "examples": {
+            "ingest": {
+                "method": "POST",
+                "path": "/db/ingest-json",
+                "body": {"path": "data/arxiv_2.9k.jsonl", "batch_size": 512, "embedding_mode": "hash"},
+            },
+            "qa": {
+                "method": "POST", 
+                "path": "/answer",
+                "body": {"query": "Explain transformer architecture.", "k": 5},
+            },
+        },
     }
+
+# ============================================================
+# 🏁 Entrypoint
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    
+    logger.info("Starting Enhanced RAG Backend API on port 8080...")
+    uvicorn.run(
+        "app.main:app", 
+        host="0.0.0.0", 
+        port=8080, 
+        reload=False,
+        log_config=None
+    )

@@ -1,169 +1,160 @@
 #!/usr/bin/env bash
 set -e
 
-# ============================================================
-# 🧠 On-Prem RAG Stack Launcher (Local FastAPI Mode)
-# ------------------------------------------------------------
-# • Runs only DB + Ollama in Docker
-# • FastAPI runs locally (e.g., uvicorn backend.app.main:app --port 8080)
-# • Waits for API readiness
-# • ✅ Automatically ingests dataset into Postgres
-# ============================================================
+echo "==============================================="
+echo "🧠 Starting On-Prem RAG Stack"
+echo "==============================================="
 
-PROJECT_NAME="onprem-rag-stack"
-OLLAMA_IMAGE="local/ollama-with-models"
-MODELS_DIR="infra/ollama/offline_models"
-MODELS_BLOBS="${MODELS_DIR}/blobs"
-MODELS_MODELS="${MODELS_DIR}/models"
-API_PORT=8080
-DATA_FILE_REL="backend/app/data/arxiv_2.9k.jsonl"
-DATA_FILE_ABS="$(cd "$(dirname "$DATA_FILE_REL")" && pwd)/$(basename "$DATA_FILE_REL")"
+# Configuration
+DATASET_PATH="${DATASET_PATH:-./backend/app/data/arxiv_2.9k.jsonl}"
+USE_OFFLINE_MODELS="${USE_OFFLINE_MODELS:-0}"
+BACKEND_URL="http://localhost:8080"
 
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-cd "$(dirname "$0")"
-
-# ------------------------------------------------------------
-# Step 1. Verify prerequisites
-# ------------------------------------------------------------
-if ! command -v docker &>/dev/null; then
-  echo "❌ Docker not found. Please install Docker first."
-  exit 1
-fi
-if ! docker compose version &>/dev/null; then
-  echo "❌ Docker Compose v2 not found. Please update Docker."
-  exit 1
+# Check if dataset exists
+if [ ! -f "$DATASET_PATH" ]; then
+    echo -e "${RED}❌ Dataset not found: $DATASET_PATH${NC}"
+    exit 1
 fi
 
+echo -e "${GREEN}📄 Using dataset: $DATASET_PATH${NC}"
 
-# ------------------------------------------------------------
-# Step 2. Check dataset availability
-# ------------------------------------------------------------
-if [ ! -f "$DATA_FILE_ABS" ]; then
-  echo "❌ Dataset not found at: $DATA_FILE_ABS"
-  echo "💡 Please ensure it exists before running."
-  exit 1
-fi
-echo "📄 Using dataset: $DATA_FILE_ABS"
-
-
-
-# ------------------------------------------------------------
-# Step 3. Prepare Ollama models
-# ------------------------------------------------------------
-mkdir -p "${MODELS_BLOBS}" "${MODELS_MODELS}"
-if [ ! "$(ls -A ${MODELS_BLOBS} 2>/dev/null)" ]; then
-  echo "🌐 No local models detected — pulling them from Ollama registry..."
-  docker run --rm \
-    -v "$(pwd)/${MODELS_MODELS}:/root/.ollama/models" \
-    -v "$(pwd)/${MODELS_BLOBS}:/root/.ollama/blobs" \
-    --entrypoint /bin/sh \
-    ollama/ollama:latest \
-    -c "(ollama serve > /tmp/ollama.log 2>&1 &) && sleep 10 && \
-        echo '👉 Pulling nomic-embed-text...' && ollama pull nomic-embed-text && \
-        echo '👉 Pulling llama3.2:3b...' && ollama pull llama3.2:3b && \
-        echo '✅ Models pulled successfully.' && \
-        pkill -f 'ollama serve' || true"
-else
-  echo "📦 Using cached Ollama models (offline mode)"
-fi
-
-# ------------------------------------------------------------
-# Step 4. Build Ollama image (offline-friendly)
-# ------------------------------------------------------------
-echo ""
-echo "🔧 Building Ollama image with offline models..."
-docker build \
-  --build-arg USE_OFFLINE_MODELS=1 \
-  -t $OLLAMA_IMAGE \
-  ./infra/ollama
-
-# ------------------------------------------------------------
-# Step 5. Launch only DB + Ollama (no FastAPI)
-# ------------------------------------------------------------
-echo ""
-echo "🚀 Starting Docker Compose stack (DB + Ollama only)..."
-docker compose down -v --remove-orphans
-docker compose up -d db ollama
-
-# ------------------------------------------------------------
-# Step 6. Wait for DB and Ollama health checks
-# ------------------------------------------------------------
-echo ""
-echo "⏳ Waiting for containers to become healthy..."
-
-wait_for_health() {
-  local container=$1
-  local label=$2
-  for i in {1..40}; do
-    STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo "starting")
-    if [ "$STATUS" = "healthy" ]; then
-      echo "✅ $label is healthy."
-      return 0
+# Pull Ollama models if needed
+if [ "$USE_OFFLINE_MODELS" = "0" ]; then
+    echo -e "${YELLOW}🌐 Checking Ollama models...${NC}"
+    
+    if ! command -v ollama &> /dev/null; then
+        echo -e "${YELLOW}👉 Ollama not installed locally, models will be pulled in Docker${NC}"
+    else
+        echo "👉 Pulling nomic-embed-text..."
+        ollama pull nomic-embed-text
+        
+        echo "👉 Pulling llama3.2:3b..."
+        ollama pull llama3.2:3b
+        
+        echo -e "${GREEN}✅ Models pulled successfully.${NC}"
     fi
-    echo "⏳ Waiting for $label... ($i/40)"
-    sleep 3
-  done
-  echo "⚠️  $label did not reach healthy status in time."
-}
-
-wait_for_health "rag_pgvector_db" "Postgres"
-wait_for_health "rag_ollama" "Ollama"
-
-# ------------------------------------------------------------
-# Step 7. Wait for local FastAPI
-# ------------------------------------------------------------
-echo ""
-echo "⏳ Waiting for local FastAPI server on port ${API_PORT}..."
-
-for i in {1..40}; do
-  if curl -s "http://127.0.0.1:${API_PORT}/health" | grep -q "ok"; then
-    echo "✅ Local FastAPI is ready!"
-    break
-  fi
-  echo "⏳ Waiting... ($i/40)"
-  sleep 3
-done
-
-# Step 8. Run ingestion from host
-echo "⏳ Waiting for Postgres to be ready before ingestion..."
-
-for i in {1..20}; do
-  if docker exec rag_pgvector_db pg_isready -U raguser -d ragdb >/dev/null 2>&1; then
-    echo "✅ Postgres is ready (attempt $i)"
-    break
-  fi
-  echo "⏳ Postgres not ready yet... ($i/20)"
-  sleep 3
-done
-
-echo "📥 Starting ingestion via local FastAPI..."
-curl -s -X POST "http://127.0.0.1:${API_PORT}/db/ingest-json" \
-  -H "Content-Type: application/json" \
-  -d "{\"path\":\"${DATA_FILE_ABS}\",\"batch_size\":64,\"embedding_mode\":\"hash\"}" \
-  | tee /tmp/ingest_result.json
-
-
-COUNT=$(docker exec -i rag_pgvector_db psql -U raguser -d ragdb -t -c "SELECT COUNT(*) FROM papers;" | tr -d '[:space:]')
-echo ""
-if [ "$COUNT" -gt 0 ]; then
-  echo "✅ Verified: $COUNT papers ingested successfully."
-else
-  echo "❌ Ingestion completed but DB appears empty. Check logs."
-  exit 1
 fi
 
+# Build Ollama image with models
+echo -e "${YELLOW}🔧 Building Docker images...${NC}"
+docker compose build
 
-# ------------------------------------------------------------
-# Step 9. Summary
-# ------------------------------------------------------------
+# Start the stack
+echo -e "${YELLOW}🚀 Starting Docker Compose stack...${NC}"
+docker compose down -v 2>/dev/null || true
+docker compose up -d
+
+# Wait for services
 echo ""
-echo "🎉 All systems ready!"
-echo "🧮 Database:  postgres://raguser:ragpass@localhost:5432/ragdb"
-echo "🤖 Ollama:    http://localhost:11434"
-echo "💬 FastAPI:   http://localhost:${API_PORT} (local)"
+echo -e "${YELLOW}⏳ Waiting for services to be ready...${NC}"
+
+# Wait for Postgres
+echo -n "Waiting for Postgres..."
+until docker compose exec -T rag_pgvector_db pg_isready -U raguser -d ragdb &>/dev/null; do
+    echo -n "."
+    sleep 2
+done
+echo -e " ${GREEN}✅${NC}"
+
+# Wait for Ollama
+echo -n "Waiting for Ollama..."
+until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do
+    echo -n "."
+    sleep 2
+done
+echo -e " ${GREEN}✅${NC}"
+
+# Wait for Backend health endpoint (Fixed - removed grep check)
+echo -n "Waiting for Backend API..."
+max_retries=60
+retry_count=0
+while [ $retry_count -lt $max_retries ]; do
+    # Check HTTP status code only, don't grep for specific content
+    if curl -sf "$BACKEND_URL/health" > /dev/null 2>&1; then
+        echo -e " ${GREEN}✅${NC}"
+        break
+    fi
+    echo -n "."
+    sleep 3
+    retry_count=$((retry_count + 1))
+done
+
+if [ $retry_count -ge $max_retries ]; then
+    echo -e " ${RED}❌ Timeout${NC}"
+    echo ""
+    echo -e "${RED}Backend failed to start. Here are the logs:${NC}"
+    docker compose logs rag_backend --tail=50
+    exit 1
+fi
+
+# Trigger data ingestion
 echo ""
-echo "👉 Example query:"
-echo "   curl -X POST http://127.0.0.1:${API_PORT}/answer \\"
-echo "        -H 'Content-Type: application/json' \\"
-echo "        -d '{\"query\":\"Explain Transformer architecture.\"}' | jq ."
+echo -e "${YELLOW}📥 Starting data ingestion...${NC}"
+INGEST_RESPONSE=$(curl -sf -X POST http://localhost:8080/db/ingest-json \
+  -H "Content-Type: application/json" \
+  -d '{"path":"app/data/arxiv_2.9k.jsonl","batch_size":64,"embedding_mode":"hash"}' 2>&1)
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✅ Ingestion request sent successfully${NC}"
+    echo "   Response: $INGEST_RESPONSE"
+    echo -e "${YELLOW}   Note: Indexing will continue in the background (5-10 minutes)${NC}"
+else
+    echo -e "${RED}❌ Failed to trigger ingestion${NC}"
+    echo "   Error: $INGEST_RESPONSE"
+    exit 1
+fi
+
+# Verify backend is responsive (Fixed - removed grep check)
+echo ""
+echo -e "${YELLOW}🔍 Verifying backend status...${NC}"
+if curl -sf "$BACKEND_URL/health" > /dev/null 2>&1; then
+    echo -e "${GREEN}✅ Backend is healthy${NC}"
+else
+    echo -e "${RED}❌ Backend health check failed${NC}"
+    exit 1
+fi
+
+# Wait for Frontend
+echo -n "Waiting for Frontend..."
+retry_count=0
+max_retries=20
+while [ $retry_count -lt $max_retries ]; do
+    if curl -sf http://localhost:3000 > /dev/null 2>&1; then
+        echo -e " ${GREEN}✅${NC}"
+        break
+    fi
+    echo -n "."
+    sleep 2
+    retry_count=$((retry_count + 1))
+done
+
+if [ $retry_count -ge $max_retries ]; then
+    echo -e " ${YELLOW}⚠️  Frontend timeout, but backend is ready${NC}"
+fi
+
+# Final status
+echo ""
+echo "==============================================="
+echo -e "${GREEN}✅ RAG Stack is Ready!${NC}"
+echo "==============================================="
+echo ""
+echo "📊 Service URLs:"
+echo "   • Frontend:  http://localhost:3000"
+echo "   • Backend:   http://localhost:8080"
+echo "   • API Docs:  http://localhost:8080/docs"
+echo "   • Ollama:    http://localhost:11434"
+echo ""
+echo "🔍 Useful Commands:"
+echo "   • View logs:      docker compose logs -f"
+echo "   • Backend logs:   docker compose logs -f rag_backend"
+echo "   • Stop stack:     docker compose down"
+echo "   • Reset data:     docker compose down -v"
+echo ""
+echo -e "${YELLOW}💡 Tip: The first query may be slow as models warm up${NC}"
 echo ""

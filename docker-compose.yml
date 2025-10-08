@@ -1,7 +1,8 @@
 name: onprem-rag-stack
 
 services:
-  db:
+  # 🗃️ Postgres + pgvector
+  rag_pgvector_db:
     image: pgvector/pgvector:pg16
     container_name: rag_pgvector_db
     restart: unless-stopped
@@ -23,7 +24,8 @@ services:
       timeout: 3s
       retries: 20
 
-  ollama:
+  # 🤖 Ollama (Embedding + LLM)
+  rag_ollama:
     build:
       context: ./infra/ollama
       dockerfile: Dockerfile
@@ -33,18 +35,67 @@ services:
     restart: unless-stopped
     environment:
       OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_NUM_PARALLEL: 1
       TZ: Asia/Jerusalem
     ports:
       - "11434:11434"
-    # REMOVE the volumes section to use built-in models
+    networks:
+      ragnet:
+        aliases:
+          - ollama    # ✅ allows backend code to call http://ollama:11434
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q 'models' || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 20
+      start_period: 90s
+
+  # 🚀 Backend (FastAPI)
+  rag_backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/app/.env
+    depends_on:
+      rag_pgvector_db:
+        condition: service_healthy
+      rag_ollama:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend/app/data/arxiv_2.9k.jsonl:/app/data/arxiv_2.9k.jsonl
     networks:
       - ragnet
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_TIMEOUT: 600
+      OLLAMA_EMBED_BATCH: 16
     healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:11434/api/tags | grep -q 'models' || exit 1"]
-      interval: 30s
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health | grep -q 'ok' || exit 1"]
+      interval: 15s
       timeout: 10s
-      retries: 20
-      start_period: 120s
+      retries: 50
+      start_period: 120s  # Increased from 40s to 120s
+
+  rag_frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rag_frontend
+    restart: unless-stopped
+    depends_on:
+      - rag_backend
+    ports:
+      - "3000:80"
+    networks:
+      - ragnet
+    environment:
+      REACT_APP_API_URL: "http://localhost:8080"
+
 
 networks:
   ragnet:
@@ -52,4 +103,3 @@ networks:
 
 volumes:
   pgdata:
-  ollama_models:
